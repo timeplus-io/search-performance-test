@@ -90,6 +90,16 @@ both engines see identical, case-sensitive tokens and hit counts can be compared
 | q19 errors per host, last day | `GROUP BY host` | `terms` aggregation |
 | q20 level per service, all data | `GROUP BY concat(service, level)` | `multi_terms` aggregation |
 | q21 services by error keywords, last day | `has_any_tokens` + `GROUP BY service` | `terms` + `terms` agg |
+| q22 regex count of 5xx | `match(message, ...)` | `regexp` on `message.wc` |
+| q23 regex extract, latency sum per service | `extract` + `sum` | ES\|QL `RLIKE` + `GROK` + `STATS` |
+| q24 grok parse, requests by status | `grok(...)['status']` | ES\|QL `GROK` |
+| q25 slow requests per host | `extract` + filter | ES\|QL `GROK` + `WHERE` |
+| q26 p95 latency per service | `quantile(..., 0.95)` | ES\|QL `PERCENTILE` (compared within 3%) |
+| q27 unique users per day | `count_distinct(extract(...))` | ES\|QL `DISSECT` + `COUNT_DISTINCT` (within 2%) |
+| q28 error log patterns | `replace_regex` + `GROUP BY` | ES\|QL `REPLACE` + `STATS` |
+| q29 error ratio per service, last day | `count_if / count` | ES\|QL `CASE` + `STATS` |
+| q30 errors per owning team (lookup join) | `JOIN service_owner` | ES\|QL `LOOKUP JOIN` |
+| q31 errors within 15 min after each deploy (join + time range) | `JOIN deployments` | ES\|QL `LOOKUP JOIN` + `WHERE` |
 
 q15 to q21 are the incident and dashboard queries people run on logs (similar to the published
 ClickHouse vs Elasticsearch log benchmark); q15, q16, q19 and q20 use no text index.
@@ -147,6 +157,12 @@ At 50M rows (same limits) Timeplus is 15x to 24x faster on the whole-data aggreg
 stays 2.5x to 7x faster on bare keyword counts and much faster on newest-N and substring search.
 With cold caches (engine restarted, OS cache dropped before each query, 10M rows) Timeplus is
 faster on 20 of 21 queries.
+
+On the log-analysis set (q22 to q31, 50M rows) Timeplus is faster on 9 of 10, from 2.6x (grok) to
+over 300x (log patterns, unique users), and the joins run 18x to 64x faster. Elasticsearch parses
+`message` from `_source` at query time; it wins the regex count (q22) through its n-gram wildcard field.
+In production Elasticsearch users usually grok at ingest instead; Timeplus can do the same with a
+materialized view, so treat the parse cases as schema-on-read comparisons.
 
 Elasticsearch leads on warm needle-in-haystack lookups, where Lucene answers counts straight from
 posting lists. Timeplus leads on ingest, storage and anything that aggregates many rows.
