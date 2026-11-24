@@ -32,8 +32,9 @@ class TP:
         from proton_driver import client
         self.c = client.Client(host=a.tp_host, port=a.tp_port, user=a.tp_user, password=a.tp_password,
                                send_receive_timeout=600)
+        self.settings = json.loads(os.getenv("TP_SETTINGS") or "{}")  # e.g. {"max_threads": 1}
     def run(self, case):
-        rows = self.c.execute(case["tp"])
+        rows = self.c.execute(case["tp"], settings=self.settings)
         if case["kind"] == "count":
             return rows[0][0]
         if case["kind"] == "groups":
@@ -52,7 +53,8 @@ class ES:
         if case["kind"] == "count":
             return r["hits"]["total"]["value"]
         if case["kind"] == "groups":
-            return {str(b["key"]): b["doc_count"] for b in r["aggregations"]["g"]["buckets"]}
+            return {(b["key_as_string"] if isinstance(b["key"], list) else str(b["key"])): b["doc_count"]
+                    for b in r["aggregations"]["g"]["buckets"]}
         return len(r["hits"]["hits"])
 
 def pct(xs, q):

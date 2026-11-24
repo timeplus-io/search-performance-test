@@ -44,6 +44,7 @@ All settings are environment variables:
 | `TP_VERSION` | `3.4.1` | Timeplus Enterprise image tag (use the newest 3.4.x / 3.5 available) |
 | `ES_VERSION` / `ES_HEAP` | `8.19.3` / `8g` | Elasticsearch image tag and JVM heap |
 | `TP_USER` / `TP_PASSWORD` | `proton` / `timeplus@t+` | Timeplus account used by the client |
+| `TP_SETTINGS` | empty | JSON of per-query Timeplus settings, e.g. `{"max_threads": 1}` (see Tuning) |
 | `KEEP_VOLUMES` | `0` | `1` keeps engine data volumes after each run |
 | `SKIP_BUILD` | `0` | `1` reuses an already built bench client image |
 
@@ -82,7 +83,10 @@ both engines see identical, case-sensitive tokens and hit counts can be compared
 | q12 Chinese word + stock code | `has_all_tokens(message, ['风控拦截', '600519'])` | 2 x `term` |
 | q13 Chinese substring | `message LIKE '%失败%'` | `wildcard` on `message.wc` |
 | q14 English substring | `message LIKE '%imeout%'` | `wildcard` on `message.wc` |
+| q15 errors per host and service | `GROUP BY concat(host, service)` over ERROR/FATAL | `multi_terms` aggregation |
+| q16 per-minute volume, whole range | `GROUP BY to_start_of_minute(log_time)` | `date_histogram` 1m |
 
+q15 and q16 use no text index; they show the analytics side of a log workload.
 All queries are in [`bench/queries.py`](bench/queries.py); add your own pairs there.
 
 ## Reading the report
@@ -90,7 +94,7 @@ All queries are in [`bench/queries.py`](bench/queries.py); add your own pairs th
 - **Latency** is client wall-clock time (Timeplus over native TCP, ES over HTTP), p50/p95 over
   runs 2..N, plus the first run.
 - **Results match = NO** means the engines returned different counts. With the tokenizer parity
-  above all 14 cases match on the generated data; a mismatch is a finding to investigate.
+  above all cases match on the generated data; a mismatch is a finding to investigate.
 - ES's request cache is disabled for every query. Timeplus has no result cache. The OS page cache is
   not dropped, so warm runs measure an in-memory working set; for cold numbers run with `RUNS=1`.
 
@@ -116,10 +120,44 @@ The Timeplus web console is at http://localhost:8000 while the Timeplus containe
 
 ## Validation status
 
-`./run.sh` was run end to end with `ROWS=1000000` on a 4 vCPU / 16 GB cloud sandbox
-(Timeplus Enterprise 3.4.1, Elasticsearch 8.19.3): every stage completed and all 14 cases returned
-identical results on both engines. Numbers from such a small run are dominated by fixed per-query
-overhead and are not representative; use 10M+ rows on dedicated hardware for conclusions.
+`./run.sh` was run end to end with `ROWS=1000000` and `ROWS=10000000` on a 4 vCPU cloud sandbox
+(Timeplus Enterprise 3.4.1, Elasticsearch 8.19.3, 4 CPUs / 8 GB per engine): every stage completed
+and all cases returned identical results on both engines. Use dedicated hardware for conclusions.
+
+What to expect (10M rows, warm, p50):
+
+| Workload | Timeplus | Elasticsearch |
+| --- | --- | --- |
+| Ingest | ~95k rows/s | ~38k rows/s |
+| Disk (data + index) | ~1.0 GB | ~2.8 GB |
+| Single token count (q01-q06) | 4-9 ms | 1-4 ms |
+| Newest 100 matches (q08) | ~110 ms (59 ms rewritten, see Tuning) | ~40 ms |
+| Substring LIKE (q13, q14) | 130-370 ms | 15-36 ms |
+| Errors per host and service (q15) | 23 ms | 305 ms |
+| Per-minute volume (q16) | 57 ms | 126 ms |
+
+Elasticsearch leads on needle-in-haystack lookups, where Lucene answers counts straight from
+posting lists. Timeplus leads on ingest, storage and anything that aggregates many rows.
+
+## Tuning Timeplus
+
+- **Many concurrent searches:** `TP_SETTINGS='{"max_threads": 1}'`. Index lookups are tiny, so
+  one thread per query halves CPU per query and improves p50 under load (28 ms to 12 ms at 8 clients).
+- **Short or high-cardinality substrings** (`LIKE '%imeout%'`): the dictionary scan can cost more
+  than a plain scan when the index holds many unique ids. Compare with
+  `{"use_text_index_like_evaluation_by_dictionary_scan": 0}` (q14: 400 ms to 130 ms here).
+  Prefer `has_token` whenever users search whole words.
+- **Newest N matches** (q08): Timeplus reads the message column for every match before the
+  LIMIT. Finding the cut-off time first reads far less:
+  ```sql
+  SELECT ... FROM table(app_logs)
+  WHERE has_token(message, 'timeout')
+    AND log_time >= (SELECT min(log_time) FROM (SELECT log_time FROM table(app_logs)
+                     WHERE has_token(message, 'timeout') ORDER BY log_time DESC LIMIT 100))
+  ORDER BY log_time DESC LIMIT 100
+  ```
+- **Fewer parts:** each query opens the index of every part (about 1.5 ms for ~60 parts at 10M
+  rows). Larger insert batches and daily partitions keep the part count low.
 
 ## Known limitations
 

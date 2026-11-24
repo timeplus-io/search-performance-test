@@ -46,6 +46,7 @@ services:
       - TP_USER=${TP_USER:-proton}
       - TP_PASSWORD=${TP_PASSWORD:-timeplus@t+}
       - ES_URL=http://elasticsearch:9200
+      - TP_SETTINGS=${TP_SETTINGS:-}
     volumes:
       - ./data:/data
       - ./results:/results

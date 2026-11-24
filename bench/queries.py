@@ -59,6 +59,17 @@ def cases(p):
                 "WHERE has_any_tokens(message, ['refused', 'timeout']) AND log_time >= '{day_start}' GROUP BY h".format(**p),
              es={**flt({"terms": {"message": ["refused", "timeout"]}}, day), "size": 0,
                  "aggs": {"g": {"date_histogram": {"field": "log_time", "fixed_interval": "1h", "min_doc_count": 1}}}}),
+        dict(id="q15_errors_by_host_service", group="analytics", kind="groups",
+             tp="SELECT concat(host, '|', service) AS k, count() FROM table(app_logs) "
+                "WHERE level IN ('ERROR', 'FATAL') GROUP BY k",
+             es={**flt({"terms": {"level": ["ERROR", "FATAL"]}}), "size": 0,
+                 "aggs": {"g": {"multi_terms": {"terms": [{"field": "host"}, {"field": "service"}],
+                                                "size": 10000}}}}),
+        dict(id="q16_level_by_minute_all", group="analytics", kind="groups",
+             tp="SELECT to_unix_timestamp(to_start_of_minute(log_time)) * 1000 AS m, count() FROM table(app_logs) "
+                "WHERE level != 'DEBUG' GROUP BY m",
+             es={**{"query": {"bool": {"must_not": [{"term": {"level": "DEBUG"}}]}}}, "size": 0,
+                 "aggs": {"g": {"date_histogram": {"field": "log_time", "fixed_interval": "1m", "min_doc_count": 1}}}}),
         # --- Chinese ---
         dict(id="q11_chinese_word", group="cjk", kind="count",
              tp=tp_count("has_token(message, '交易失败')"),
