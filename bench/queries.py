@@ -6,7 +6,8 @@ kind:
   rows   -> both return up to N rows (row count compared; ties make ordering differ)
 
 Placeholders: {trace} (a real trace id from the manifest), {since} / {since_iso}
-(6 hours before the end of the dataset), {day_start} / {day_iso} (last day).
+(6 hours before the end of the dataset), {day_start} / {day_iso} (last day),
+{hour_start} / {hour_iso} (last hour).
 """
 
 def cases(p):
@@ -21,6 +22,7 @@ def cases(p):
 
     time6h = {"range": {"log_time": {"gte": p["since_iso"]}}}
     day = {"range": {"log_time": {"gte": p["day_iso"]}}}
+    hour = {"range": {"log_time": {"gte": p["hour_iso"]}}}
     return [
         # --- selective token search (posting lists only) ---
         dict(id="q01_rare_token", group="token", kind="count",
@@ -70,6 +72,32 @@ def cases(p):
                 "WHERE level != 'DEBUG' GROUP BY m",
              es={**{"query": {"bool": {"must_not": [{"term": {"level": "DEBUG"}}]}}}, "size": 0,
                  "aggs": {"g": {"date_histogram": {"field": "log_time", "fixed_interval": "1m", "min_doc_count": 1}}}}),
+        # --- incident drill-down and dashboards: scoped by service / level / time, as people use logs ---
+        dict(id="q17_incident_drilldown", group="incident", kind="rows",
+             tp="SELECT log_time, host, message FROM table(app_logs) WHERE service = 'payment-service' "
+                "AND level = 'ERROR' AND log_time >= '{hour_start}' AND has_token(message, 'timeout') "
+                "ORDER BY log_time DESC LIMIT 50".format(**p),
+             es={**flt({"term": {"service": "payment-service"}}, {"term": {"level": "ERROR"}}, hour, term("timeout")),
+                 "size": 50, "sort": [{"log_time": "desc"}], "_source": ["log_time", "host", "message"]}),
+        dict(id="q18_service_token_5min_day", group="incident", kind="groups",
+             tp="SELECT to_unix_timestamp(to_start_of_interval(log_time, 5m)) * 1000 AS b, count() FROM table(app_logs) "
+                "WHERE service = 'api-gateway' AND log_time >= '{day_start}' AND has_token(message, 'timeout') GROUP BY b".format(**p),
+             es={**flt({"term": {"service": "api-gateway"}}, day, term("timeout")), "size": 0,
+                 "aggs": {"g": {"date_histogram": {"field": "log_time", "fixed_interval": "5m", "min_doc_count": 1}}}}),
+        dict(id="q19_errors_per_host_day", group="dashboard", kind="groups",
+             tp="SELECT host, count() FROM table(app_logs) WHERE level IN ('ERROR', 'FATAL') "
+                "AND log_time >= '{day_start}' GROUP BY host".format(**p),
+             es={**flt({"terms": {"level": ["ERROR", "FATAL"]}}, day), "size": 0,
+                 "aggs": {"g": {"terms": {"field": "host", "size": 1000}}}}),
+        dict(id="q20_level_by_service_all", group="dashboard", kind="groups",
+             tp="SELECT concat(service, '|', level) AS k, count() FROM table(app_logs) GROUP BY k",
+             es={"size": 0, "aggs": {"g": {"multi_terms": {"terms": [{"field": "service"}, {"field": "level"}],
+                                                          "size": 10000}}}}),
+        dict(id="q21_top_services_by_token_day", group="dashboard", kind="groups",
+             tp="SELECT service, count() FROM table(app_logs) WHERE log_time >= '{day_start}' "
+                "AND has_any_tokens(message, ['timeout', 'refused', 'OutOfMemoryError']) GROUP BY service".format(**p),
+             es={**flt({"terms": {"message": ["timeout", "refused", "OutOfMemoryError"]}}, day), "size": 0,
+                 "aggs": {"g": {"terms": {"field": "service", "size": 100}}}}),
         # --- Chinese ---
         dict(id="q11_chinese_word", group="cjk", kind="count",
              tp=tp_count("has_token(message, '交易失败')"),

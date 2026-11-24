@@ -85,8 +85,14 @@ both engines see identical, case-sensitive tokens and hit counts can be compared
 | q14 English substring | `message LIKE '%imeout%'` | `wildcard` on `message.wc` |
 | q15 errors per host and service | `GROUP BY concat(host, service)` over ERROR/FATAL | `multi_terms` aggregation |
 | q16 per-minute volume, whole range | `GROUP BY to_start_of_minute(log_time)` | `date_histogram` 1m |
+| q17 incident drill-down | one service, ERROR, last hour, `has_token`, newest 50 | `bool` + `sort` |
+| q18 one service, keyword, 5-minute buckets, last day | `GROUP BY to_start_of_interval(log_time, 5m)` | `date_histogram` 5m |
+| q19 errors per host, last day | `GROUP BY host` | `terms` aggregation |
+| q20 level per service, all data | `GROUP BY concat(service, level)` | `multi_terms` aggregation |
+| q21 services by error keywords, last day | `has_any_tokens` + `GROUP BY service` | `terms` + `terms` agg |
 
-q15 and q16 use no text index; they show the analytics side of a log workload.
+q15 to q21 are the incident and dashboard queries people run on logs (similar to the published
+ClickHouse vs Elasticsearch log benchmark); q15, q16, q19 and q20 use no text index.
 All queries are in [`bench/queries.py`](bench/queries.py); add your own pairs there.
 
 ## Reading the report
@@ -136,7 +142,13 @@ What to expect (10M rows, warm, p50):
 | Errors per host and service (q15) | 23 ms | 305 ms |
 | Per-minute volume (q16) | 57 ms | 126 ms |
 
-Elasticsearch leads on needle-in-haystack lookups, where Lucene answers counts straight from
+At 50M rows (same limits) Timeplus is 15x to 24x faster on the whole-data aggregations (q15, q20),
+1.2x to 2.8x faster on scoped incident queries (q17 to q19), and uses 3.1x less disk; Elasticsearch
+stays 2.5x to 7x faster on bare keyword counts and much faster on newest-N and substring search.
+With cold caches (engine restarted, OS cache dropped before each query, 10M rows) Timeplus is
+faster on 20 of 21 queries.
+
+Elasticsearch leads on warm needle-in-haystack lookups, where Lucene answers counts straight from
 posting lists. Timeplus leads on ingest, storage and anything that aggregates many rows.
 
 ## Tuning Timeplus

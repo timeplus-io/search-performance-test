@@ -21,11 +21,11 @@ RESULTS = os.getenv("RESULTS_DIR", "results")
 def params(data):
     m = json.load(open(os.path.join(data, "manifest.json")))
     end = datetime.fromtimestamp(m["end"] / 1000, tz=timezone.utc)
-    since, day = end - timedelta(hours=6), end - timedelta(days=1)
+    since, day, hour = end - timedelta(hours=6), end - timedelta(days=1), end - timedelta(hours=1)
     f = lambda d: d.strftime("%Y-%m-%d %H:%M:%S")
     iso = lambda d: d.strftime("%Y-%m-%dT%H:%M:%SZ")
     return {"trace": m["sample_trace_ids"][0], "since": f(since), "since_iso": iso(since),
-            "day_start": f(day), "day_iso": iso(day)}
+            "day_start": f(day), "day_iso": iso(day), "hour_start": f(hour), "hour_iso": iso(hour)}
 
 class TP:
     def __init__(self, a):
