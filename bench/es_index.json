@@ -1,0 +1,51 @@
+{
+  "settings": {
+    "number_of_shards": 1,
+    "number_of_replicas": 0,
+    "refresh_interval": "30s",
+    "codec": "best_compression",
+    "analysis": {
+      "tokenizer": {
+        "ascii_non_alnum": {
+          "type": "pattern",
+          "pattern": "[\\x00-\\x2F\\x3A-\\x40\\x5B-\\x60\\x7B-\\x7F]+"
+        }
+      },
+      "analyzer": {
+        "tp_parity": {
+          "type": "custom",
+          "tokenizer": "ascii_non_alnum"
+        }
+      }
+    }
+  },
+  "mappings": {
+    "dynamic": "strict",
+    "properties": {
+      "log_time": {
+        "type": "date"
+      },
+      "level": {
+        "type": "keyword"
+      },
+      "service": {
+        "type": "keyword"
+      },
+      "host": {
+        "type": "keyword"
+      },
+      "trace_id": {
+        "type": "keyword"
+      },
+      "message": {
+        "type": "text",
+        "analyzer": "tp_parity",
+        "fields": {
+          "wc": {
+            "type": "wildcard"
+          }
+        }
+      }
+    }
+  }
+}

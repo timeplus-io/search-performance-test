@@ -1,0 +1,2 @@
+proton-driver==0.2.13
+elasticsearch==8.19.1
