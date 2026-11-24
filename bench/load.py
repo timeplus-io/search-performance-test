@@ -8,7 +8,7 @@ Prints and saves results/load_<target>.json: rows, seconds, rows/s, on-disk byte
 """
 import argparse, glob, gzip, json, os, time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RESULTS = os.getenv("RESULTS_DIR", "results")
@@ -121,6 +121,52 @@ def es_wait_and_size(a, expected):
             "segments": st["segments"]["count"], "bytes_on_disk": st["store"]["size_in_bytes"]}
 
 # ---------------------------------------------------------------- main
+# ------------------------------------------------- small dimension tables for the JOIN cases
+SERVICES = ["auth-service", "api-gateway", "payment-service", "order-service", "trade-service",
+            "quote-service", "risk-service", "account-service", "settlement-service", "market-data",
+            "notification-service", "report-service", "clearing-service", "margin-service",
+            "position-service", "user-service"]
+TEAMS = ["trading", "payments", "platform", "risk"]
+
+def dims(data):
+    """service -> owning team, and three deployments per service during the last day."""
+    end_ms = json.load(open(os.path.join(data, "manifest.json")))["end"]
+    owners = [{"service": s, "team": TEAMS[i % len(TEAMS)]} for i, s in enumerate(SERVICES)]
+    deploys = []
+    for i, s in enumerate(SERVICES):
+        for hours, step in ((2, 17), (8, 23), (16, 11)):
+            ms = end_ms - (hours * 3600 + i * step * 60) * 1000
+            deploys.append({"service": s, "version": f"v{i}.{hours}", "deploy_time": ms})
+    return owners, deploys
+
+def tp_dims(a):
+    owners, deploys = dims(a.data)
+    c = tp_client(a)
+    for name, ddl in (("service_owner", "CREATE STREAM service_owner (service string, team string)"),
+                      ("deployments", "CREATE STREAM deployments (service string, version string, deploy_time datetime64(3, 'UTC'))")):
+        c.execute(f"DROP STREAM IF EXISTS {name}")
+        c.execute(ddl)
+    time.sleep(2)
+    c.execute("INSERT INTO service_owner (service, team) VALUES", [(o["service"], o["team"]) for o in owners])
+    c.execute("INSERT INTO deployments (service, version, deploy_time) VALUES",
+              [(d["service"], d["version"], datetime.fromtimestamp(d["deploy_time"] / 1000, timezone.utc)) for d in deploys])
+    for name, n in (("service_owner", len(owners)), ("deployments", len(deploys))):
+        for _ in range(60):
+            if c.execute(f"SELECT count() FROM table({name})")[0][0] == n:
+                break
+            time.sleep(1)
+
+def es_dims(a):
+    from elasticsearch import helpers
+    owners, deploys = dims(a.data)
+    es = es_client(a)
+    for name, props, docs in (("service_owner", {"service": {"type": "keyword"}, "team": {"type": "keyword"}}, owners),
+                              ("deployments", {"service": {"type": "keyword"}, "version": {"type": "keyword"},
+                                               "deploy_time": {"type": "date"}}, deploys)):
+        es.indices.delete(index=name, ignore_unavailable=True)
+        es.indices.create(index=name, settings={"index.mode": "lookup"}, mappings={"properties": props})
+        helpers.bulk(es, ({"_index": name, "_source": d} for d in docs), refresh="wait_for")
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--target", choices=["tp", "es"], required=True)
@@ -133,7 +179,10 @@ def main():
     ap.add_argument("--es-url", default=os.getenv("ES_URL", "http://localhost:9200"))
     ap.add_argument("--es-shards", type=int, default=1)
     ap.add_argument("--es-forcemerge", action="store_true", help="force-merge to 1 segment after load")
+    ap.add_argument("--dims-only", action="store_true", help="only (re)create the small JOIN tables")
     a = ap.parse_args()
+    if a.dims_only:
+        return (tp_dims if a.target == "tp" else es_dims)(a)
 
     files = sorted(glob.glob(os.path.join(a.data, "part-*.ndjson.gz")))
     expected = json.load(open(os.path.join(a.data, "manifest.json")))["rows"]
@@ -145,6 +194,7 @@ def main():
     with ThreadPoolExecutor(a.workers) as ex:
         loaded = sum(ex.map(lambda p: load_file(a, p), files))
     ingest_s = time.time() - t0
+    (tp_dims if a.target == "tp" else es_dims)(a)
     res = {"target": a.target, "rows_sent": loaded, "ingest_s": round(ingest_s, 1),
            "rows_per_s": round(loaded / ingest_s), **finish(a, expected)}
     os.makedirs(os.path.join(RESULTS), exist_ok=True)

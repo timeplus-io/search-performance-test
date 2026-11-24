@@ -98,6 +98,63 @@ def cases(p):
                 "AND has_any_tokens(message, ['timeout', 'refused', 'OutOfMemoryError']) GROUP BY service".format(**p),
              es={**flt({"terms": {"message": ["timeout", "refused", "OutOfMemoryError"]}}, day), "size": 0,
                  "aggs": {"g": {"terms": {"field": "service", "size": 100}}}}),
+        # --- log analysis: regex, grok, percentiles, distinct, patterns, joins (ES side in ES|QL) ---
+        dict(id="q22_regex_5xx_count", group="parse", kind="count",
+             tp=tp_count("match(message, 'status=5[0-9]{2} ')"),
+             es=flt({"regexp": {"message.wc": {"value": ".*status=5[0-9]{2} .*"}}})),
+        dict(id="q23_regex_latency_sum_by_service", group="parse", kind="groups",
+             tp="SELECT service, sum(to_int64(extract(message, 'latency_ms=([0-9]+)'))) FROM table(app_logs) "
+                "WHERE has_token(message, 'latency') AND match(message, 'status=5[0-9]{2} ') GROUP BY service",
+             esql='FROM app_logs | WHERE MATCH(message, "latency") AND message RLIKE ".*status=5[0-9]{2} .*" '
+                  '| GROK message "latency_ms=%{INT:lat:int}" | STATS s = SUM(lat) BY service | KEEP service, s'),
+        dict(id="q24_grok_requests_by_status", group="parse", kind="groups",
+             tp="SELECT grok(message, 'GET %{URIPATH:path} status=%{INT:status} latency_ms=%{INT:lat} trace=%{WORD:trace}%{GREEDYDATA:rest}')['status'] AS st, "
+                "count() FROM table(app_logs) WHERE has_token(message, 'latency') GROUP BY st",
+             esql='FROM app_logs | WHERE MATCH(message, "latency") '
+                  '| GROK message "GET %{URIPATH:path} status=%{INT:status} latency_ms=%{INT:lat} trace=%{WORD:trace}%{GREEDYDATA:rest}" '
+                  '| STATS c = COUNT(*) BY status | KEEP status, c'),
+        dict(id="q25_slow_requests_per_host", group="parse", kind="groups",
+             tp="SELECT host, count() FROM table(app_logs) WHERE has_token(message, 'latency') "
+                "AND to_int32(extract(message, 'latency_ms=([0-9]+)')) > 2500 GROUP BY host",
+             esql='FROM app_logs | WHERE MATCH(message, "latency") | GROK message "latency_ms=%{INT:lat:int}" '
+                  '| WHERE lat > 2500 | STATS c = COUNT(*) BY host | KEEP host, c'),
+        dict(id="q26_p95_latency_by_service", group="parse", kind="groups", tolerance=0.03,
+             tp="SELECT service, quantile(to_int32(extract(message, 'latency_ms=([0-9]+)')), 0.95) FROM table(app_logs) "
+                "WHERE has_token(message, 'latency') GROUP BY service",
+             esql='FROM app_logs | WHERE MATCH(message, "latency") | GROK message "latency_ms=%{INT:lat:int}" '
+                  '| STATS p = PERCENTILE(lat, 95) BY service | KEEP service, p'),
+        dict(id="q27_unique_users_per_day", group="parse", kind="groups", tolerance=0.02,
+             tp="SELECT to_unix_timestamp(to_start_of_day(log_time)) * 1000 AS d, "
+                "count_distinct(extract(message, 'user ([0-9]+) login')) FROM table(app_logs) "
+                "WHERE has_token(message, 'login') GROUP BY d",
+             esql='FROM app_logs | WHERE MATCH(message, "login") | DISSECT message "user %{uid} login %{rest}" '
+                  '| EVAL d = TO_LONG(DATE_TRUNC(1 day, log_time)) | STATS u = COUNT_DISTINCT(uid, 40000) BY d | KEEP d, u'),
+        dict(id="q28_error_patterns", group="parse", kind="groups",
+             tp="SELECT replace_regex(message, '[0-9a-f]{8,}|[0-9]+', '#') AS pat, count() AS c FROM table(app_logs) "
+                "WHERE level IN ('ERROR', 'FATAL') GROUP BY pat HAVING c > 1000",
+             esql='FROM app_logs | WHERE level IN ("ERROR", "FATAL") '
+                  '| EVAL pat = REPLACE(message, "[0-9a-f]{8,}|[0-9]+", "#") | STATS c = COUNT(*) BY pat '
+                  '| WHERE c > 1000 | KEEP pat, c'),
+        dict(id="q29_error_ratio_by_service_day", group="agg", kind="groups",
+             tp="SELECT service, round(count_if(level IN ('ERROR', 'FATAL')) / count(), 4) FROM table(app_logs) "
+                "WHERE log_time >= '{day_start}' GROUP BY service".format(**p),
+             esql='FROM app_logs | WHERE log_time >= "{day_iso}" | EVAL e = CASE(level IN ("ERROR", "FATAL"), 1, 0) '
+                  '| STATS errors = SUM(e), total = COUNT(*) BY service '
+                  '| EVAL r = ROUND(TO_DOUBLE(errors) / total, 4) | KEEP service, r'.format(**p)),
+        dict(id="q30_join_errors_by_team", group="join", kind="groups",
+             tp="SELECT o.team, count() FROM table(app_logs) AS l INNER JOIN table(service_owner) AS o "
+                "ON l.service = o.service WHERE l.level IN ('ERROR', 'FATAL') GROUP BY o.team",
+             esql='FROM app_logs | WHERE level IN ("ERROR", "FATAL") | LOOKUP JOIN service_owner ON service '
+                  '| STATS c = COUNT(*) BY team | KEEP team, c'),
+        dict(id="q31_join_errors_after_deploy", group="join", kind="groups",
+             tp="SELECT d.service, count() FROM table(app_logs) AS l INNER JOIN table(deployments) AS d "
+                "ON l.service = d.service WHERE l.level IN ('ERROR', 'FATAL') AND l.log_time >= '{day_start}' "
+                "AND l.log_time >= d.deploy_time AND l.log_time < d.deploy_time + INTERVAL 15 MINUTE "
+                "GROUP BY d.service".format(**p),
+             esql='FROM app_logs | WHERE level IN ("ERROR", "FATAL") AND log_time >= "{day_iso}" '
+                  '| LOOKUP JOIN deployments ON service '
+                  '| WHERE log_time >= deploy_time AND log_time < deploy_time + 15 minutes '
+                  '| STATS c = COUNT(*) BY service | KEEP service, c'.format(**p)),
         # --- Chinese ---
         dict(id="q11_chinese_word", group="cjk", kind="count",
              tp=tp_count("has_token(message, '交易失败')"),

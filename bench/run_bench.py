@@ -27,6 +27,18 @@ def params(data):
     return {"trace": m["sample_trace_ids"][0], "since": f(since), "since_iso": iso(since),
             "day_start": f(day), "day_iso": iso(day), "hour_start": f(hour), "hour_iso": iso(hour)}
 
+def _key(k):
+    return str(k)
+
+def _num(v):
+    return round(v, 4) if isinstance(v, float) else v
+
+def same(x, y, tol=0.0):
+    """Exact match, or within a relative tolerance for approximate aggregates (e.g. distinct counts)."""
+    if not tol or not isinstance(x, dict) or not isinstance(y, dict):
+        return x == y
+    return x.keys() == y.keys() and all(abs(x[k] - y[k]) <= tol * max(abs(x[k]), abs(y[k]), 1) for k in x)
+
 class TP:
     def __init__(self, a):
         from proton_driver import client
@@ -38,7 +50,7 @@ class TP:
         if case["kind"] == "count":
             return rows[0][0]
         if case["kind"] == "groups":
-            return {str(k): v for k, v in rows}
+            return {_key(k): _num(v) for k, v in rows}
         return len(rows)
 
 class ES:
@@ -46,6 +58,13 @@ class ES:
         from elasticsearch import Elasticsearch
         self.es = Elasticsearch(a.es_url, request_timeout=600)
     def run(self, case):
+        if "esql" in case:  # ES|QL: the query ends with KEEP <value> or KEEP <key>, <value>
+            vals = self.es.esql.query(query=case["esql"])["values"]
+            if case["kind"] == "count":
+                return vals[0][0]
+            if case["kind"] == "groups":
+                return {_key(k): _num(v) for k, v in vals}
+            return len(vals)
         body = dict(case["es"])
         if case["kind"] == "count":
             body.update(size=0, track_total_hits=True)
@@ -75,7 +94,7 @@ def latency_mode(eng, cs, runs):
                 break
             times.append((time.perf_counter() - t0) * 1000)
         warm = times[1:] or times
-        rec = {"id": c["id"], "group": c["group"], "result": result,
+        rec = {"id": c["id"], "group": c["group"], "tolerance": c.get("tolerance", 0), "result": result,
                "first_ms": round(times[0], 1) if times else None,
                "p50_ms": round(statistics.median(warm), 1) if warm else None,
                "p95_ms": round(pct(warm, 0.95), 1) if warm else None}
@@ -138,9 +157,10 @@ def report():
             y = rb.get(k, {})
             px, py = x.get("p50_ms"), y.get("p50_ms")
             faster = "" if not (px and py) else (f"TP {py / px:.1f}x" if px < py else f"ES {px / py:.1f}x")
-            same = "yes" if x.get("result") == y.get("result") else "NO"
+            ok = same(x.get("result"), y.get("result"), x.get("tolerance", 0))
+            same_ = ("yes" if not x.get("tolerance") else f"yes (within {x['tolerance']:.0%})") if ok else "NO"
             out.append(f"| {k} | {px} | {py} | {x.get('p95_ms')} | {y.get('p95_ms')} | "
-                       f"{x.get('first_ms')} | {y.get('first_ms')} | {faster} | {same} |")
+                       f"{x.get('first_ms')} | {y.get('first_ms')} | {faster} | {same_} |")
         out.append("")
     tps = sorted(f for f in os.listdir(RESULTS) if f.startswith("throughput_")) if os.path.isdir(RESULTS) else []
     if tps:
